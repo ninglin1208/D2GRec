@@ -1,0 +1,173 @@
+# Sports
+embedding_size: 256 #64
+
+n_ui_layers: 3  #3
+n_mm_layers: 2
+knn_k: 100
+
+mi_hidden_dim : 128 #64
+
+avg_lambda: 0.2
+alpha : 0.4  #0.6
+lambda_1 : 0.01
+lambda_2 : 0.01
+
+#w_diff : 0.01
+#w_align : 0.01
+
+gen_type: "diffusion"
+
+infer_adj_update  : true
+
+infoNCETemp : 0.4
+alignBMTemp : 0.38    #0.28
+alignUITemp : 0.2   #0.2
+
+lambda_bpr : 1.2 #1
+lambda_gen : 0.003  #0.003
+lambda_recon : 0.002 #0.002
+
+
+beta_kl : 0.0005   #0.0005
+lambda_refine : 0.008 #0.008
+reg_weight : 1e-05
+lr_club : 0.001
+
+dropout_rate : 0.2
+
+gradient_clip_norm : 2.0
+
+early_stopping_patience : 15
+
+refinement_steps : 1
+
+mi_update_frequency: 3
+adj_update_frequency: 5
+prompt_length: 32      #32
+
+dropout_prob : 0.2   #0.2
+top_k_retrieval: 500
+MAX_ITEM_LIST_LENGTH: 50
+
+max_seq_len : 50
+
+#lambda_align: 0.01
+
+# Diffusion
+cfg_scale: 3.5
+diff_timesteps: 1000
+cond_dropout: 0.1
+# Ranking
+use_hard_neg: True
+lambda_hard: 0.8
+# Short-term sequence
+
+# Iterative completion (新加)
+gen_rounds: 5
+gen_m: 8
+gen_thresh: 0.55
+gen_cfg_w: 3.5
+
+z_dim :
+
+coarse_fuse_alpha : 1
+msmlp_prompt_scale : 0.8
+
+use_fixed_short_weight : true
+short_term_weight : 0.95
+gate_bias_init : 0.2
+
+progressive_integration : True
+
+loss_nce: 0.01
+base_k : 10
+max_k: 80
+min_k: 20
+
+weight_decay: 1e-4
+
+use_graph_attention: True
+attention_dropout: 0.05
+gat_warmup_epochs : 5
+
+adaptive_knn: True
+maturity_threshold : 0.3
+integration_rate : 0.2
+
+enable_missing_modal_generation : true
+score_tau : 1
+
+gate_loss_weight: 0.5
+use_ib: true
+ib_weight: 0.0001   #1.0e-4
+
+n_side_layers: int = 1
+
+# New item settings
+# New item settings
+new_items: true
+new_item_alpha: 0.85
+new_item_thresh: 0.5
+
+latent_dim: 128
+
+gen_blend_alpha: 0.04
+new_item_warmup_epochs: 8
+generate_only_new: false
+
+use_invariance_loss : true
+
+infer_writeback_weights: true
+infer_writeback_scope: session
+
+consistency_thresh : 0.7
+
+gen_warmup_epochs : 0
+gen_interval_epochs : 1
+
+skip_stage2 : false
+
+lambda_rec: 0.2
+lambda_cos : 0.1
+rec_gamma: 1
+
+diff_refine_steps: 5
+
+evaluate_generation_quality: True
+
+use_ib_kl: true
+use_ib_disentangle: true
+use_ib_latent_recon: true
+
+w_disentangle: 0.5
+w_latent_recon: 0.5
+ib_beta_shared: 0.005  #0.005
+ib_beta_private: 0.008  #0.008
+
+momentum_eta: 1
+maturity_trigger_threshold: 0.8
+
+use_feature_diffusion: true
+use_stage1_gen: true
+use_stage2_gen: true
+
+mean_fill_old_items: false
+
+gen_quality_threshold: 0.55
+use_gen_quality_maturity: False
+quality_weight_in_maturity: 0.3
+
+use_adaptive_threshold: True
+adaptive_threshold_strategy: hybrid
+threshold_min: 0.45
+threshold_max: 0.6
+threshold_warmup_epochs: 50
+threshold_percentile: 0.6
+threshold_hybrid_alpha: 0.5
+
+use_hsic_constraint: False
+use_ortho_constraint: True
+
+maturity_weight_interaction: 0.4
+maturity_weight_degree: 0.3
+maturity_weight_quality: 0.3
