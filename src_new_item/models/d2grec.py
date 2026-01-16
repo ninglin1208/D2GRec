@@ -6,23 +6,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Tuple
+from typing import Tuple, Optional
 import torch.optim as optim
 from logging import getLogger
-from common.abstract_recommender import GeneralRecommender
-from utils.utils import build_sim, compute_normalized_laplacian, build_knn_neighbourhood, build_knn_normalized_graph
-from utils.mi_estimator import *
-from common.loss import MSELoss
-import glob
-from datetime import datetime
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+# Assuming these modules exist in your project structure
+from src_new_item.common.abstract_recommender import GeneralRecommender
+from src_new_item.utils.utils import build_sim, compute_normalized_laplacian, build_knn_neighbourhood
+from src_new_item.utils.mi_estimator import *
+from src_new_item.common.loss import MSELoss
 
 class DiffusionRefiner(nn.Module):
     """
-    ResMLP version of Diffusion Refiner (interface consistent with the original):
-    - Replaced the original three-layer MLP with multi-layer Residual + FiLM conditioning.
-    - Still supports classifier-free guidance (CFG) and the original sampling process.
-    - Directly compatible with your existing cond design (e.g., 4096+64 / 384+64).
+    ResMLP-based Diffusion Refiner (Interface consistent with original):
+    - Replaces the original three-layer MLP with multi-layer Residual + FiLM conditioning.
+    - Supports classifier-free guidance (CFG) and the original sampling process.
+    - Directly compatible with existing cond designs (e.g., 4096+64 / 384+64).
     """
     def __init__(self, feat_dim, cond_dim, timesteps=20, cond_dropout=0.2, guidance_scale=3.0,
                  n_blocks=4, inner_mult=4, dropout=0.1):
@@ -33,16 +33,16 @@ class DiffusionRefiner(nn.Module):
         self.cond_dim = int(cond_dim)
         self.feat_dim = int(feat_dim)
 
-        # Time embedding (keeping original 64 dimensions)
+        # Time Embedding (Keeping original 64 dimensions)
         self.t_embed = nn.Sequential(nn.Linear(1, 64), nn.SiLU(), nn.Linear(64, 64))
 
-        # Condition encoding: fuse [cond, t_emb] into a conditional hidden vector
+        # Conditional Encoding: Fuse [cond, t_emb] into a conditional hidden vector
         self.cond_proj = nn.Sequential(
             nn.Linear(self.cond_dim + 64, max(256, feat_dim)), nn.SiLU(),
             nn.Linear(max(256, feat_dim), max(256, feat_dim))
         )
 
-        inner = max(128, min(1024, feat_dim * inner_mult // 2))  # Inner width, controls parameter count
+        inner = max(128, min(1024, feat_dim * inner_mult // 2))  # Inner width, controlling parameter size
 
         class FiLMResBlock(nn.Module):
             def __init__(self, feat_dim, cond_hid, inner, dropout=0.1):
@@ -77,6 +77,8 @@ class DiffusionRefiner(nn.Module):
     def _pack_cond(self, x, cond, t):
         B = x.size(0)
         dev = x.device
+
+        # 1) Handle cond shape: ensure it is [B, self.cond_dim]
         if cond is None:
             cond = torch.zeros(B, self.cond_dim, device=dev)
         elif cond.dim() != 2 or cond.size(1) != self.cond_dim:
@@ -84,9 +86,26 @@ class DiffusionRefiner(nn.Module):
                 cond = cond[:, :self.cond_dim]
             else:
                 pad = self.cond_dim - cond.size(1)
-                cond = torch.cat([cond, torch.zeros(B, pad, device=dev, dtype=cond.dtype)], dim=1)
-        t_emb = self.t_embed(t.float().view(-1, 1) / max(self.timesteps, 1))
-        cond_h = self.cond_proj(torch.cat([cond, t_emb], dim=-1))
+                cond = torch.cat(
+                    [cond, torch.zeros(cond.size(0), pad, device=dev, dtype=cond.dtype)],
+                    dim=1
+                )
+
+        # 2) Handle timestep t: could be scalar / [1] / [B], broadcast to [B]
+        if t.dim() == 0:
+            t = t.expand(B)
+        elif t.dim() == 1 and t.size(0) == 1 and B > 1:
+            t = t.expand(B)
+
+        # t is now guaranteed to be [B]
+        t_emb = self.t_embed(t.float().view(-1, 1) / max(self.timesteps, 1))  # [B, 64]
+
+        # Guard against edge cases
+        if t_emb.size(0) == 1 and B > 1:
+            t_emb = t_emb.expand(B, -1)
+
+        # 3) Concatenate cond and t_emb to get conditional hidden vector
+        cond_h = self.cond_proj(torch.cat([cond, t_emb], dim=-1))  # [B, cond_hid]
         return cond_h
 
     def forward(self, x0, cond, t, train_cfg=True):
@@ -118,14 +137,14 @@ class DiffusionRefiner(nn.Module):
         alpha_bars = torch.cumprod(alphas, dim=0)
         x = x_init
 
-        # Prepare cond_h for "unconditional" generation
+        # Prepare "unconditional" cond_h
         zero_cond = torch.zeros_like(cond)
         for t in reversed(range(self.timesteps)):
             # Conditional / Unconditional branches
             cond_h_c = self._pack_cond(x, cond, torch.tensor([t], device=device))
             cond_h_u = self._pack_cond(x, zero_cond, torch.tensor([t], device=device))
 
-            # Shared network, run separately
+            # Run network for both branches
             def run_blocks(x, cond_h):
                 h = x
                 for blk in self.blocks:
@@ -192,34 +211,33 @@ class AdaptiveKNNBuilder:
         self.max_k = max_k
 
     def get_adaptive_k(self, item_maturity):
-        """Return adaptive k value based on item maturity"""
-        # Higher maturity implies larger k value
+        """Returns adaptive k value based on item maturity"""
+        # Higher maturity -> larger k
         adaptive_k = self.min_k + (self.max_k - self.min_k) * item_maturity
         return torch.clamp(adaptive_k, self.min_k, self.max_k).int()
 
     def build_adaptive_knn(self, similarity_matrix, item_maturity_scores):
-        """Build adaptive KNN graph"""
+        """Builds adaptive KNN graph"""
         n_items = similarity_matrix.size(0)
-        device = similarity_matrix.device
-
+        
         # Create adjacency matrix
         adj_matrix = torch.zeros_like(similarity_matrix)
 
         for i in range(n_items):
-            # Get adaptive k value for this item
+            # Get adaptive k for current item
             k_i = self.get_adaptive_k(item_maturity_scores[i]).item()
 
-            # Find the most similar k_i neighbors
+            # Find top k_i similar neighbors
             similarities = similarity_matrix[i]
             _, top_k_indices = torch.topk(similarities, k_i + 1)  # +1 to exclude self
 
             # Exclude self
             top_k_indices = top_k_indices[top_k_indices != i][:k_i]
 
-            # Set adjacency relationship
+            # Set adjacency
             adj_matrix[i, top_k_indices] = similarities[top_k_indices]
 
-        # Symmetrization
+        # Symmetrize
         adj_matrix = (adj_matrix + adj_matrix.t()) / 2
 
         return adj_matrix
@@ -227,11 +245,6 @@ class AdaptiveKNNBuilder:
 
 class D2GRec(GeneralRecommender):
     def __init__(self, config, dataset, logger=None):
-
-        if 'n_users' in config and 'n_items' in config:
-            self.n_users = config['n_users']
-            self.n_items = config['n_items']
-
         super(D2GRec, self).__init__(config, dataset)
 
         if 'n_users' in config and 'n_items' in config:
@@ -241,6 +254,19 @@ class D2GRec(GeneralRecommender):
         self.config = config
         self.use_feature_diffusion = bool(config['use_feature_diffusion'])
 
+        # ===== Two-stage generation ablation switches =====
+        # Stage-1 coarse generator
+        self.use_stage1_gen = bool(config['use_stage1_gen'])
+
+        # Stage-2 diffusion refiner (inherits from use_feature_diffusion)
+        self.use_stage2_gen = bool(config['use_stage2_gen'])
+
+        # Master switch for missing modal generation
+        if 'enable_missing_modal_generation' in config:
+            self.enable_missing_modal_generation = bool(config['enable_missing_modal_generation'])
+        else:
+            self.enable_missing_modal_generation = self.use_stage1_gen or self.use_stage2_gen
+
         # ===== Improvement 1: Progressive Graph Integration Parameters =====
         self.progressive_integration = config['progressive_integration']
         self.maturity_threshold = config['maturity_threshold']
@@ -248,16 +274,17 @@ class D2GRec(GeneralRecommender):
 
         # ===== Improvement 2: Adaptive KNN Parameters =====
         self.adaptive_knn = config['adaptive_knn']
-        self.base_k = config['base_k',]
+        self.base_k = config['base_k']
         self.min_k = config['min_k']
         self.max_k = config['max_k']
 
-        # ===== Improvement 3: Graph Attention Mechanism Parameters =====
+        # ===== Improvement 3: Graph Attention Parameters =====
         self.use_graph_attention = config['use_graph_attention']
         self.attention_dropout = config['attention_dropout']
 
         self.cfg_scale = float(config['cfg_scale'])
         self.new_items = int(self.config['new_items'])
+        
         if self.new_items:
             dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
             new_items_path = os.path.join(dataset_path, "new_items.npy")
@@ -280,18 +307,18 @@ class D2GRec(GeneralRecommender):
         self.msmlp_prompt_scale = float(self.config['msmlp_prompt_scale'])
         self.coarse_fuse_alpha = float(self.config['coarse_fuse_alpha'])
 
-        # Short-term/Long-term Interest Parameters
+        # Short-term / Long-term interest parameters
         self.use_fixed_short_weight = bool(self.config['use_fixed_short_weight'])
         self.short_term_weight = float(self.config['short_term_weight'])
         self.gate_bias_init = float(self.config['gate_bias_init'])
 
-        # New Item Related Parameters
+        # New item related parameters
         self.new_item_alpha = float(config['new_item_alpha'])
         self.new_item_thresh = float(config['new_item_thresh'])
         self.new_item_warmup_epochs = int(config['new_item_warmup_epochs'])
         self.generate_only_new = bool(config['generate_only_new'])
+        # gen_blend_alpha is redundant with new_item_alpha, but keeping for consistency if used elsewhere
         self.gen_blend_alpha = float(self.config['new_item_alpha'])
-        self.diff_timesteps = int(self.config['diff_timesteps'])
 
         self.freeze_pretrained_features = config['freeze_pretrained_features']
         self.freeze_encoders_after_epoch = config['freeze_encoders_after_epoch']
@@ -299,9 +326,7 @@ class D2GRec(GeneralRecommender):
         self.adj_update_frequency = config['adj_update_frequency']
         self.current_epoch = 0
 
-        self.enable_missing_modal_generation = True
-
-        # ===== Initialize Improvement Components =====
+        # ===== Initialize Components =====
         # 1. Adaptive KNN Builder
         self.adaptive_knn_builder = AdaptiveKNNBuilder(
             base_k=self.base_k,
@@ -313,7 +338,7 @@ class D2GRec(GeneralRecommender):
         self.item_interaction_counts = torch.zeros(self.n_items, device=self.device)
         self.item_maturity_scores = torch.zeros(self.n_items, device=self.device)
 
-        # 3. Graph Attention Layer
+        # 3. Graph Attention Layers
         if self.use_graph_attention:
             self.image_gat = GraphAttentionLayer(
                 self.embedding_dim, self.embedding_dim,
@@ -338,22 +363,17 @@ class D2GRec(GeneralRecommender):
         self.prompt_to_image_proj = nn.Linear(64, 4096).to(self.device)
         self.prompt_to_text_proj = nn.Linear(64, 384).to(self.device)
 
-        # Multi-scale MLP Components
-        self.image_scale_1 = nn.Sequential(nn.Linear(4096, 2048), nn.ReLU(), nn.Linear(2048, 4096), nn.Tanh()).to(
-            self.device)
-        self.image_scale_2 = nn.Sequential(nn.Linear(4096, 1024), nn.ReLU(), nn.Linear(1024, 4096), nn.Tanh()).to(
-            self.device)
-        self.image_scale_3 = nn.Sequential(nn.Linear(4096, 512), nn.ReLU(), nn.Linear(512, 4096), nn.Tanh()).to(
-            self.device)
-        self.text_scale_1 = nn.Sequential(nn.Linear(384, 256), nn.ReLU(), nn.Linear(256, 384), nn.Tanh()).to(
-            self.device)
-        self.text_scale_2 = nn.Sequential(nn.Linear(384, 128), nn.ReLU(), nn.Linear(128, 384), nn.Tanh()).to(
-            self.device)
+        # Multi-scale MLP components
+        self.image_scale_1 = nn.Sequential(nn.Linear(4096, 2048), nn.ReLU(), nn.Linear(2048, 4096), nn.Tanh()).to(self.device)
+        self.image_scale_2 = nn.Sequential(nn.Linear(4096, 1024), nn.ReLU(), nn.Linear(1024, 4096), nn.Tanh()).to(self.device)
+        self.image_scale_3 = nn.Sequential(nn.Linear(4096, 512), nn.ReLU(), nn.Linear(512, 4096), nn.Tanh()).to(self.device)
+        self.text_scale_1 = nn.Sequential(nn.Linear(384, 256), nn.ReLU(), nn.Linear(256, 384), nn.Tanh()).to(self.device)
+        self.text_scale_2 = nn.Sequential(nn.Linear(384, 128), nn.ReLU(), nn.Linear(128, 384), nn.Tanh()).to(self.device)
         self.text_scale_3 = nn.Sequential(nn.Linear(384, 64), nn.ReLU(), nn.Linear(64, 384), nn.Tanh()).to(self.device)
         self.image_fusion_attn = nn.Sequential(nn.Linear(4096 * 3, 3), nn.Softmax(dim=-1)).to(self.device)
         self.text_fusion_attn = nn.Sequential(nn.Linear(384 * 3, 3), nn.Softmax(dim=-1)).to(self.device)
 
-        # Adaptive Weighting Parameters
+        # Adaptive weighting parameters
         self.log_sigma_bpr = nn.Parameter(torch.zeros(1))
         self.log_sigma_align = nn.Parameter(torch.zeros(1))
         self.log_sigma_gen = nn.Parameter(torch.zeros(1))
@@ -400,12 +420,7 @@ class D2GRec(GeneralRecommender):
         self.diff_txt = DiffusionRefiner(feat_dim=384, cond_dim=cond_txt_dim, timesteps=self.diff_timesteps,
                                          guidance_scale=self.cfg_scale).to(self.device)
 
-        self.optimizer_diff = optim.Adam(
-            list(self.diff_img.parameters()) + list(self.diff_txt.parameters()),
-            lr=1e-4, weight_decay=1e-5
-        )
-
-        # Verifier/Feedback Layer Parameters
+        # Verifier / Feedback parameters
         _z_candidate = self.config['z_dim']
         if _z_candidate is None:
             _z_candidate = self.config['latent_dim']
@@ -424,7 +439,7 @@ class D2GRec(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
 
-        # Dynamic Weighting Related
+        # Dynamic Weighting
         self.time_decay_lambda = 0.01
         self.enable_dynamic_weighting = True
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
@@ -459,13 +474,28 @@ class D2GRec(GeneralRecommender):
         if self.missing_modal:
             self.preprocess_missing_modal(config)
 
+        self.momentum_eta = float(config['momentum_eta'])  # Momentum update step
+
         # Modality Feature Initialization and Graph Construction
+        # ========= Modality Feature Initialization =========
+        self.image_embedding = None
+        self.text_embedding = None
+
         if self.v_feat is not None:
-            self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=self.freeze_pretrained_features)
+            self.image_embedding = nn.Embedding.from_pretrained(
+                self.v_feat, freeze=self.freeze_pretrained_features
+            )
+
+        if self.t_feat is not None:
+            self.text_embedding = nn.Embedding.from_pretrained(
+                self.t_feat, freeze=self.freeze_pretrained_features
+            )
+
+        # ========= Initial Graph Construction (Using the two embeddings above) =========
+        if self.v_feat is not None:
             self._build_adaptive_image_graph()
 
         if self.t_feat is not None:
-            self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=self.freeze_pretrained_features)
             self._build_adaptive_text_graph()
 
         torch.cuda.empty_cache()
@@ -487,7 +517,7 @@ class D2GRec(GeneralRecommender):
         nn.init.xavier_uniform_(self.image_preference_.weight)
         nn.init.xavier_uniform_(self.text_preference_.weight)
 
-        # Other components... (maintaining original structure)
+        # Precompute user preferences for image/text
         self.user_item_image_pref = torch.sparse.mm(self.adj.t(),
                                                     self.image_preference_(self.user_embedding.weight.to(self.device)))
         self.user_item_text_pref = torch.sparse.mm(self.adj.t(),
@@ -508,7 +538,7 @@ class D2GRec(GeneralRecommender):
         self.text_gen = nn.Sequential(nn.Linear(self.embedding_dim, self.embedding_dim), nn.Tanh(),
                                       nn.Linear(self.embedding_dim, 384), nn.Tanh()).to(self.device)
 
-        # Cross-Modality Transformation
+        # Cross-modal Translation
         self.image2text = nn.Sequential(nn.Linear(self.embedding_dim, self.embedding_dim), nn.Tanh(),
                                         nn.Linear(self.embedding_dim, self.embedding_dim)).to(self.device)
         self.text2image = nn.Sequential(nn.Linear(self.embedding_dim, self.embedding_dim), nn.Tanh(),
@@ -522,15 +552,15 @@ class D2GRec(GeneralRecommender):
 
         # Hyperparameters
         self.alpha = config['alpha']
-        self.lambda_1 = config['lambda_1']
-        self.lambda_2 = config['lambda_2']
+        self.w_diff = config['w_diff']
+        self.w_align = config['w_align']
         self.infoNCETemp = config['infoNCETemp']
         self.alignBMTemp = config['alignBMTemp']
         self.alignUITemp = config['alignUITemp']
         self.act_g = nn.Tanh()
         self.refresh_adj_counter = 0
 
-        # Other Projection Layers
+        # Additional Projections
         self.image_from_text_proj = nn.Linear(4096, self.embedding_dim).to(self.device)
         self.text_from_image_proj = nn.Linear(384, self.embedding_dim).to(self.device)
         self.fine_image_gen = nn.Sequential(nn.Linear(4096 + 64, 1024), nn.ReLU(), nn.Linear(1024, 4096), nn.Tanh()).to(
@@ -568,7 +598,7 @@ class D2GRec(GeneralRecommender):
                             list(self.q_image_from_text.parameters()) + list(self.k_image_from_text.parameters()) +
                             list(self.q_text_from_image.parameters()) + list(self.k_text_from_image.parameters()))
 
-        # Add Graph Attention Parameters
+        # Add Graph Attention Parameters if enabled
         if self.use_graph_attention:
             core_params += list(self.image_gat.parameters()) + list(self.text_gat.parameters())
 
@@ -594,6 +624,19 @@ class D2GRec(GeneralRecommender):
         self.ib_beta_shared = config['ib_beta_shared']
         self.ib_beta_private = config['ib_beta_private']
 
+        # ===== IB Module Switches & Weights (For Ablation) =====
+        # Master Switch: Enable IB Disentanglement Module
+        self.use_ib = bool(config['use_ib'])
+
+        # Sub-switches
+        self.use_ib_kl = bool(config['use_ib_kl'])                   # KL Regularization
+        self.use_ib_disentangle = bool(config['use_ib_disentangle']) # Disentanglement Loss
+        self.use_ib_latent_recon = bool(config['use_ib_latent_recon'])  # Latent Space Reconstruction Consistency
+
+        # IB Internal Loss Weights
+        self.w_disentangle = float(config['w_disentangle'])
+        self.w_latent_recon = float(config['w_latent_recon'])
+
         self.ib_heads = nn.ModuleDict({
             's_img': nn.Linear(self.z_dim, self.z_dim * 2),
             's_txt': nn.Linear(self.z_dim, self.z_dim * 2),
@@ -609,6 +652,18 @@ class D2GRec(GeneralRecommender):
         self.img_private_enc = nn.Sequential(nn.Linear(self.embedding_dim, self.z_dim), nn.Tanh()).to(self.device)
         self.txt_private_enc = nn.Sequential(nn.Linear(self.embedding_dim, self.z_dim), nn.Tanh()).to(self.device)
 
+        # === Modality Specific Linear Transforms for Graph Construction W_m^{sh}, W_m^{sp} ===
+        self.W_img_sh = nn.Linear(self.z_dim, self.embedding_dim).to(self.device)
+        self.W_img_sp = nn.Linear(self.z_dim, self.embedding_dim).to(self.device)
+        self.W_txt_sh = nn.Linear(self.z_dim, self.embedding_dim).to(self.device)
+        self.W_txt_sp = nn.Linear(self.z_dim, self.embedding_dim).to(self.device)
+        for m in [self.W_img_sh, self.W_img_sp, self.W_txt_sh, self.W_txt_sp]:
+            nn.init.xavier_uniform_(m.weight)
+
+        # Control relative weight of shared/specific in graph construction
+        self.graph_lambda_img = float(config['graph_lambda_img']) if 'graph_lambda_img' in config else 0.5
+        self.graph_lambda_txt = float(config['graph_lambda_txt']) if 'graph_lambda_txt' in config else 0.5
+
         self.dec_image = nn.Sequential(
             nn.Linear(self.z_dim * 2, 1024), nn.ReLU(),
             nn.Linear(1024, 4096)
@@ -618,7 +673,7 @@ class D2GRec(GeneralRecommender):
             nn.Linear(512, 384)
         ).to(self.device)
 
-        # Stage 1 Generator
+        # Stage-1 Generator
         self.stage1_shared_gen = nn.Sequential(
             nn.Linear(self.z_dim + 64, self.z_dim), nn.ReLU(),
             nn.Linear(self.z_dim, self.z_dim)
@@ -632,7 +687,7 @@ class D2GRec(GeneralRecommender):
             nn.Linear(self.z_dim, self.z_dim)
         ).to(self.device)
 
-        # Short-term/Long-term Interest Modeling
+        # Short-term / Long-term Interest Modeling
         self.max_seq_len = config['max_seq_len']
         self.short_encoder = nn.GRU(self.embedding_dim, self.embedding_dim, batch_first=True)
         self.gate_mlp = nn.Sequential(
@@ -644,26 +699,53 @@ class D2GRec(GeneralRecommender):
         nn.init.constant_(self.gate_mlp[-1].bias,
                           0.0 if self.use_fixed_short_weight else self.gate_bias_init)
 
-        # Stage 2 Latent Space Diffusion
+        # User channel weights (ID / Image / Text), personalized per user
+        self.modal_weight_head = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.embedding_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim // 2, 3)  # [w_id, w_img, w_txt]
+        ).to(self.device)
+
+        # ===== Stage-2 Latent Space Diffusion =====
         cond_latent = 64 + self.embedding_dim
-        self.diff_shared = DiffusionRefiner(feat_dim=self.z_dim, cond_dim=cond_latent, timesteps=self.diff_timesteps,
-                                            guidance_scale=self.cfg_scale).to(self.device)
-        self.diff_priv_img = DiffusionRefiner(feat_dim=self.z_dim, cond_dim=cond_latent, timesteps=self.diff_timesteps,
-                                              guidance_scale=self.cfg_scale).to(self.device)
-        self.diff_priv_txt = DiffusionRefiner(feat_dim=self.z_dim, cond_dim=cond_latent, timesteps=self.diff_timesteps,
-                                              guidance_scale=self.cfg_scale).to(self.device)
+        self.diff_shared = DiffusionRefiner(
+            feat_dim=self.z_dim, cond_dim=cond_latent,
+            timesteps=self.diff_timesteps, guidance_scale=self.cfg_scale
+        ).to(self.device)
+        self.diff_priv_img = DiffusionRefiner(
+            feat_dim=self.z_dim, cond_dim=cond_latent,
+            timesteps=self.diff_timesteps, guidance_scale=self.cfg_scale
+        ).to(self.device)
+        self.diff_priv_txt = DiffusionRefiner(
+            feat_dim=self.z_dim, cond_dim=cond_latent,
+            timesteps=self.diff_timesteps, guidance_scale=self.cfg_scale
+        ).to(self.device)
+
+        # -- Projection for two types of conditions (both compressed to embedding_dim) --
+        # Shared Chain: Existing Modal Shared Semantics + Item ID Embedding
+        self.cond_proj_shared = nn.Linear(self.embedding_dim * 2, self.embedding_dim).to(self.device)
+        # Private Chain: User Preference (Short+Long) + Item ID Embedding
+        self.cond_proj_user = nn.Linear(self.embedding_dim * 2, self.embedding_dim).to(self.device)
+
+        # Global Prompt: 64d, time-independent prior
+        self.global_prompt = nn.Parameter(torch.randn(64), requires_grad=True)
 
         # Add new parameters to optimizer
-        self.optimizer_main.add_param_group({"params": list(self.img_shared_enc.parameters())
-                                                       + list(self.txt_shared_enc.parameters())
-                                                       + list(self.img_private_enc.parameters())
-                                                       + list(self.txt_private_enc.parameters())
-                                                       + list(self.dec_image.parameters())
-                                                       + list(self.dec_text.parameters())
-                                                       + list(self.stage1_shared_gen.parameters())
-                                                       + list(self.stage1_priv_img_gen.parameters())
-                                                       + list(self.stage1_priv_txt_gen.parameters())})
-
+        self.optimizer_main.add_param_group({
+            "params": list(self.img_shared_enc.parameters())
+                      + list(self.txt_shared_enc.parameters())
+                      + list(self.img_private_enc.parameters())
+                      + list(self.txt_private_enc.parameters())
+                      + list(self.dec_image.parameters())
+                      + list(self.dec_text.parameters())
+                      + list(self.stage1_shared_gen.parameters())
+                      + list(self.stage1_priv_img_gen.parameters())
+                      + list(self.stage1_priv_txt_gen.parameters())
+                      + list(self.W_img_sh.parameters())
+                      + list(self.W_img_sp.parameters())
+                      + list(self.W_txt_sh.parameters())
+                      + list(self.W_txt_sp.parameters())
+        })
         # Diffusion Optimizer
         self.optimizer_diff = optim.Adam(
             list(getattr(self, "diff_img", nn.Sequential()).parameters()) +
@@ -673,7 +755,7 @@ class D2GRec(GeneralRecommender):
             lr=1e-4, weight_decay=1e-5
         )
 
-        # Device Moving
+        # Move to Device
         self.logger.info(f"Recursively moving all model components to device: {self.device}")
         if not self.enable_missing_modal_generation:
             self.freeze_modules([self.diff_img, self.diff_txt,
@@ -689,12 +771,40 @@ class D2GRec(GeneralRecommender):
 
         self.use_graph_attention = False  # Force disable high-memory GAT path
 
+    def _get_user_modal_weights(self, user_emb_batch):
+        # user_emb_batch: [B, d]
+        w = self.modal_weight_head(user_emb_batch)  # [B, 3]
+        return torch.softmax(w, dim=-1)  # Sum of each row is 1
+
+    def pre_epoch_processing(self):
+        # Can clear counters here if needed, leaving empty for now
+        return None
+
+    def post_epoch_processing(self):
+        """Called after each epoch to perform progressive graph updates based on maturity"""
+        self.current_epoch += 1
+
+        info = f"[D2GRec] Epoch {self.current_epoch} end."
+
+        # Update only if progressive integration is enabled & missing modalities/new items exist
+        if self.missing_modal and self.progressive_integration:
+            # Maturity threshold should be in config
+            self.maturity_trigger_threshold = float(self.config['maturity_trigger_threshold'])
+
+            maturity_scores = self._compute_item_maturity()
+            if (maturity_scores >= self.maturity_trigger_threshold).any():
+                # Only update items reaching the threshold
+                self.update_adj(maturity_mask=(maturity_scores >= self.maturity_trigger_threshold))
+                info += f" Updated adjacency matrix (progressive_integration={self.progressive_integration})."
+
+        return info
+
     def _compute_item_maturity(self):
-        """Compute item maturity scores"""
-        # Maturity based on interaction counts
+        """Compute item maturity score (3 dimensions: Interaction Count + Graph Connectivity + Generation Quality)"""
+        # 1. Maturity based on interaction count
         interaction_maturity = torch.clamp(self.item_interaction_counts / 100.0, 0, 1)
 
-        # Maturity based on neighbor connection counts (Graph Connectivity)
+        # 2. Maturity based on neighbor connections (Graph Connectivity)
         if hasattr(self, 'image_adj') and hasattr(self, 'text_adj'):
             image_degree = torch.sparse.sum(self.image_adj, dim=1).to_dense()
             text_degree = torch.sparse.sum(self.text_adj, dim=1).to_dense()
@@ -702,34 +812,190 @@ class D2GRec(GeneralRecommender):
         else:
             degree_maturity = torch.zeros_like(interaction_maturity)
 
-        # Combined maturity score
-        self.item_maturity_scores = 0.6 * interaction_maturity + 0.4 * degree_maturity
+        # 3. Maturity based on generation quality (Cycle Consistency)
+        if self.missing_modal and hasattr(self, 'image2text') and hasattr(self, 'text2image'):
+            generation_quality_maturity = self._compute_generation_quality()
+        else:
+            generation_quality_maturity = torch.zeros_like(interaction_maturity)
+
+        # Combined Maturity Score (Weighted)
+        w_interact = float(self.config['maturity_weight_interaction'])
+        w_degree = float(self.config['maturity_weight_degree'])
+        w_quality = float(self.config['maturity_weight_quality'])
+
+        self.item_maturity_scores = (
+            w_interact * interaction_maturity +
+            w_degree * degree_maturity +
+            w_quality * generation_quality_maturity
+        )
 
         return self.item_maturity_scores
 
+    @torch.no_grad()
+    def _compute_generation_quality(self):
+        """
+        Evaluate generation quality based on Cycle Consistency:
+        - Missing Image Only: Validate generated image with real text (Gen Image -> Recon Text vs Real Text)
+        - Missing Text Only: Validate generated text with real image (Gen Text -> Recon Image vs Real Image)
+        - Both Missing: Degrade to interaction count proxy
+
+        Calculation is identical for training and inference as missing modality flags are predetermined.
+        """
+        quality_scores = torch.ones(self.n_items, device=self.device)
+
+        if not self.missing_modal:
+            return quality_scores
+
+        # Get current modality embeddings (encoded)
+        item_image_emb = torch.sigmoid(
+            self.shared_encoder(torch.sigmoid(self.image_encoder(self.image_embedding.weight)))
+        )
+        item_text_emb = torch.sigmoid(
+            self.shared_encoder(torch.sigmoid(self.text_encoder(self.text_embedding.weight)))
+        )
+
+        # ===== Case 1: Missing Image Only, Real Text Exists =====
+        only_v_missing = np.setdiff1d(self.missing_items_v, self.missing_items_t)
+        if len(only_v_missing) > 0:
+            idx_v = torch.from_numpy(only_v_missing).long().to(self.device)
+
+            # Generated Image Embedding
+            gen_img_emb = item_image_emb[idx_v]
+
+            # Real Text Embedding (Exists in train/infer)
+            real_txt_emb = item_text_emb[idx_v]
+
+            # Cycle Consistency: Gen Image -> Recon Text
+            reconstructed_txt = self.image2text(gen_img_emb)
+
+            # Cycle Error (MSE)
+            cycle_error = F.mse_loss(
+                reconstructed_txt, real_txt_emb, reduction='none'
+            ).mean(dim=-1)
+
+            # Convert to quality score: exp(-error), normalized to [0,1]
+            max_error = cycle_error.max()
+            if max_error > 1e-6:
+                quality_v = torch.exp(-cycle_error / max_error)
+            else:
+                quality_v = torch.ones_like(cycle_error)
+
+            quality_scores[idx_v] = quality_v
+
+        # ===== Case 2: Missing Text Only, Real Image Exists =====
+        only_t_missing = np.setdiff1d(self.missing_items_t, self.missing_items_v)
+        if len(only_t_missing) > 0:
+            idx_t = torch.from_numpy(only_t_missing).long().to(self.device)
+
+            # Generated Text Embedding
+            gen_txt_emb = item_text_emb[idx_t]
+
+            # Real Image Embedding
+            real_img_emb = item_image_emb[idx_t]
+
+            # Cycle Consistency: Gen Text -> Recon Image
+            reconstructed_img = self.text2image(gen_txt_emb)
+
+            # Cycle Error
+            cycle_error = F.mse_loss(
+                reconstructed_img, real_img_emb, reduction='none'
+            ).mean(dim=-1)
+
+            # Convert to quality score
+            max_error = cycle_error.max()
+            if max_error > 1e-6:
+                quality_t = torch.exp(-cycle_error / max_error)
+            else:
+                quality_t = torch.ones_like(cycle_error)
+
+            quality_scores[idx_t] = quality_t
+
+        # ===== Case 3: Both Missing -> Cannot use cycle consistency, degrade to interaction count =====
+        both_missing = np.intersect1d(self.missing_items_v, self.missing_items_t)
+        if len(both_missing) > 0:
+            idx_both = torch.from_numpy(both_missing).long().to(self.device)
+
+            # Use interaction count as quality proxy
+            interaction_quality = torch.clamp(
+                self.item_interaction_counts[idx_both] / 100.0, 0, 1
+            )
+            quality_scores[idx_both] = interaction_quality
+
+        return quality_scores
+
+    def _get_modal_graph_features(self):
+        """
+        Build modality features for KNN based on IB disentangled shared / specific factors:
+        Returns (img_feat, txt_feat), each [n_items, d].
+        If IB is disabled, degrades to using original modality embeddings directly.
+        """
+        # Fallback to original features if IB is off
+        if not getattr(self, 'use_ib', False):
+            img_feat = self.image_embedding.weight.detach()
+            txt_feat = self.text_embedding.weight.detach()
+            return img_feat, txt_feat
+
+        with torch.no_grad():
+            # Disentangled Encoding: Get z_s_img, z_v, z_s_txt, z_t
+            z_s_img, z_v, z_s_txt, z_t, _ = self.encode_disentangled_ib()
+
+            # Image Modality Graph Features g_i^{(img,0)}
+            img_feat = self.W_img_sh(z_s_img) + self.graph_lambda_img * self.W_img_sp(z_v)
+            # Text Modality Graph Features g_i^{(txt,0)}
+            txt_feat = self.W_txt_sh(z_s_txt) + self.graph_lambda_txt * self.W_txt_sp(z_t)
+
+        return img_feat.detach(), txt_feat.detach()
+
+    def _two_stage_generate(self, base_shared, base_priv, prompt,
+                            cond_shared, decoder, stage1_priv_gen):
+        """
+        base_shared/base_priv: Shared / Private latent from IB encoding
+        prompt: 64d prompt
+        cond_shared: diffusion condition (shared latent or feat condition)
+        decoder: dec_image / dec_text
+        stage1_priv_gen: stage1_priv_img_gen / stage1_priv_txt_gen
+        """
+        # ---------- Stage-1: coarse ----------
+        if self.use_stage1_gen:
+            z_s_coarse = self.stage1_shared_gen(torch.cat([base_shared, prompt], dim=-1))
+            z_p_coarse = stage1_priv_gen(torch.cat([base_priv, prompt], dim=-1))
+        else:
+            # w/o Stage-1: Use IB latent directly as coarse init
+            z_s_coarse = base_shared
+            z_p_coarse = base_priv
+
+        # ---------- Stage-2: diffusion refine ----------
+        if self.use_stage2_gen:
+            z_s_refined = self.diff_shared.sample_cfg(z_s_coarse, cond_shared)
+            feat = decoder(torch.cat([z_s_refined, z_p_coarse], dim=-1))
+        else:
+            # w/o Stage-2: Decode coarse directly
+            feat = decoder(torch.cat([z_s_coarse, z_p_coarse], dim=-1))
+
+        return feat
+
     def _build_adaptive_image_graph(self):
-        """Build adaptive image modality graph"""
-        image_adj = build_sim(self.image_embedding.weight.detach())
+        """Build adaptive image modality graph (IB Disentangled Version)"""
+        # 1. Use g_img combined from IB disentangled shared/specific as graph features
+        img_feat, _ = self._get_modal_graph_features()
+        image_adj = build_sim(img_feat)
 
         if self.adaptive_knn:
-            # Compute item maturity
             maturity_scores = self._compute_item_maturity()
-            # Build graph using adaptive KNN
             image_adj = self.adaptive_knn_builder.build_adaptive_knn(image_adj, maturity_scores)
         else:
-            # Traditional fixed KNN
             image_adj = build_knn_neighbourhood(image_adj, topk=self.knn_k)
 
-        # Missing Modality Handling
+        # Handle missing modalities
         if self.missing_modal and hasattr(self, 'missing_items_v') and len(self.missing_items_v) > 0:
             if self.progressive_integration:
-                # Progressive integration: isolate only immature new items
+                # Progressive integration: Isolate only immature new items
                 immature_missing = self._get_immature_items(self.missing_items_v)
                 image_adj[immature_missing, :] = 0.0
                 image_adj[:, immature_missing] = 0.0
                 image_adj.fill_diagonal_(1.0)
             else:
-                # Traditional method: complete isolation
+                # Traditional method: Complete isolation
                 image_adj[self.missing_items_v, :] = 0.0
                 image_adj[:, self.missing_items_v] = 0.0
                 image_adj.fill_diagonal_(1.0)
@@ -739,27 +1005,25 @@ class D2GRec(GeneralRecommender):
 
     def _build_adaptive_text_graph(self):
         """Build adaptive text modality graph"""
-        text_adj = build_sim(self.text_embedding.weight.detach())
+        _, txt_feat = self._get_modal_graph_features()
+        text_adj = build_sim(txt_feat)
 
         if self.adaptive_knn:
-            # Compute item maturity
             maturity_scores = self._compute_item_maturity()
-            # Build graph using adaptive KNN
             text_adj = self.adaptive_knn_builder.build_adaptive_knn(text_adj, maturity_scores)
         else:
-            # Traditional fixed KNN
             text_adj = build_knn_neighbourhood(text_adj, topk=self.knn_k)
 
-        # Missing Modality Handling
+        # Handle missing modalities
         if self.missing_modal and hasattr(self, 'missing_items_t') and len(self.missing_items_t) > 0:
             if self.progressive_integration:
-                # Progressive integration: isolate only immature new items
+                # Progressive integration: Isolate only immature new items
                 immature_missing = self._get_immature_items(self.missing_items_t)
                 text_adj[immature_missing, :] = 0.0
                 text_adj[:, immature_missing] = 0.0
                 text_adj.fill_diagonal_(1.0)
             else:
-                # Traditional method: complete isolation
+                # Traditional method: Complete isolation
                 text_adj[self.missing_items_t, :] = 0.0
                 text_adj[:, self.missing_items_t] = 0.0
                 text_adj.fill_diagonal_(1.0)
@@ -774,8 +1038,8 @@ class D2GRec(GeneralRecommender):
         return item_indices[immature_mask.cpu().numpy()]
 
     def _progressive_graph_propagation(self, features, adj_matrix, modality="image"):
-        """Graph Propagation (Low Memory Version: use sparse multiplication only, no NxN attention)"""
-        # Use sparse adjacency matrix multiplication directly to avoid to_dense and N^2 memory overhead
+        """Graph propagation (Low memory version: uses sparse multiplication only, no NxN attention)"""
+        # Directly use sparse adjacency matrix multiplication to avoid to_dense and N^2 memory overhead
         return torch.sparse.mm(adj_matrix, features)
 
     def update_item_interactions(self, items):
@@ -785,7 +1049,7 @@ class D2GRec(GeneralRecommender):
 
     def progressive_update_adj(self):
         """Progressively update adjacency matrix"""
-        print(f"Epoch {self.current_epoch}: Progressively update adjacency matrix")
+        print(f"Epoch {self.current_epoch}: Progressive adjacency matrix update")
 
         with torch.no_grad():
             # Recompute maturity
@@ -793,23 +1057,29 @@ class D2GRec(GeneralRecommender):
 
             # Find items that recently became mature
             newly_mature = (maturity_scores >= self.maturity_threshold) & (
-                        maturity_scores < self.maturity_threshold + 0.1)
+                    maturity_scores < self.maturity_threshold + 0.1
+            )
 
             if newly_mature.any():
-                mature_indices = torch.where(newly_mature)[0]
+                # Move to CPU, convert to python int list for CPU-only logic
+                mature_indices = torch.where(newly_mature)[0].cpu().tolist()
 
-                # Progressively add connections for newly mature items
+                # Convert missing indices to set for faster lookup
+                missing_v_set = set(map(int, np.array(getattr(self, "missing_items_v", []))))
+                missing_t_set = set(map(int, np.array(getattr(self, "missing_items_t", []))))
+
+                # Gradually add connections for newly mature items
                 for idx in mature_indices:
-                    if idx in self.missing_items_v:
+                    if idx in missing_v_set:
                         self._gradually_connect_item(idx, modality="image")
-                    if idx in self.missing_items_t:
+                    if idx in missing_t_set:
                         self._gradually_connect_item(idx, modality="text")
 
     def _gradually_connect_item(self, item_idx, modality="image"):
-        """Progressively add graph connections for a single item"""
+        """Gradually add graph connections for a single item"""
         with torch.no_grad():
             if modality == "image":
-                # Recompute similarity with this item
+                # Recompute similarity
                 similarities = torch.cosine_similarity(
                     self.image_embedding.weight[item_idx:item_idx + 1],
                     self.image_embedding.weight,
@@ -828,11 +1098,11 @@ class D2GRec(GeneralRecommender):
             maturity = self.item_maturity_scores[item_idx]
             k = self.adaptive_knn_builder.get_adaptive_k(maturity).item()
 
-            # Find the most similar k neighbors
+            # Find top k neighbors
             _, top_k_indices = torch.topk(similarities, k + 1)
             top_k_indices = top_k_indices[top_k_indices != item_idx][:k]
 
-            # Progressive update: use integration_rate to control update intensity
+            # Progressive update: control update strength with integration_rate
             new_connections = similarities[top_k_indices] * self.integration_rate
             adj_matrix[item_idx, top_k_indices] = new_connections
             adj_matrix[top_k_indices, item_idx] = new_connections
@@ -843,7 +1113,6 @@ class D2GRec(GeneralRecommender):
             else:
                 self.text_adj = compute_normalized_laplacian(adj_matrix).to_sparse_coo()
 
-    # Keep other original methods unchanged, but use new attention mechanism in graph propagation
     def mge(self):
         item_image_emb = F.sigmoid(self.image_encoder(self.image_embedding.weight))
         item_text_emb = F.sigmoid(self.text_encoder(self.text_embedding.weight))
@@ -869,18 +1138,78 @@ class D2GRec(GeneralRecommender):
 
     def _broadcast_prompt(self, n: int, device):
         """
-        Broadcast self.prompt_complete to match the number of entries in latent variable z.
-        Returns tensor of shape [n, dimP]; if P does not exist, returns None (external call will skip diffusion).
+        Broadcast self.prompt_complete to match latent variable entries.
+        - If prompt_complete is [L,dim] (multi-token), average over tokens to get [1,dim] global prompt.
+        - If [dim], convert to [1,dim].
+        Then expand to [n,dim].
         """
-        P = getattr(self, 'prompt_complete', None)
+        P = getattr(self, "prompt_complete", None)
         if P is None:
             return None
+
+        # P: [L, dim] or [dim]
         if P.dim() == 1:
-            P = P.unsqueeze(0)  # [1, dimP]
-        # Force expand to [n, dimP] regardless of whether original was [1, dimP] or [m, dimP]
-        if P.size(0) != n:
-            P = P.expand(n, P.size(1))
+            # [dim] -> [1,dim]
+            P = P.unsqueeze(0)
+        elif P.dim() == 2 and P.size(0) > 1:
+            # [L,dim] (multi-token) -> Average to get global prompt: [1,dim]
+            P = P.mean(dim=0, keepdim=True)
+
+        # P.shape[0] is now 1, safe to expand to [n,dim]
+        P = P.expand(n, P.size(1)).contiguous()
         return P.to(device)
+
+    def _build_shared_condition(self,
+                                item_idx: torch.Tensor,
+                                z_s_img: torch.Tensor,
+                                z_s_txt: torch.Tensor):
+        """
+        Stage-2 Shared Chain Condition:
+        Use item's shared latent on image/text side as semantic condition.
+        item_idx: [K]
+        """
+        if item_idx.numel() == 0:
+            return None
+
+        # [K,2*z_dim] -> [K, z_dim]
+        core = torch.cat([z_s_img[item_idx], z_s_txt[item_idx]], dim=-1)
+        core = self.cond_proj_shared(core)  # [K, embedding_dim]
+
+        # Here n = K (number of items)
+        prompt = self._broadcast_prompt(core.size(0), core.device)  # [K,64] or None
+        if prompt is None:
+            return core
+
+        # Final condition: [K, 64 + embedding_dim]
+        return torch.cat([prompt, core], dim=-1)
+
+    def _build_private_condition(self,
+                                 user_batch_emb: torch.Tensor,
+                                 pos_items: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Stage-2 Private Chain Condition:
+        Use "User Preference + Item Semantics" as condition.
+        user_batch_emb: [B, d]  User preference after gating, corresponds to pos_items
+        pos_items:      [B]     Positive sample item IDs in current batch
+        """
+        if user_batch_emb is None or user_batch_emb.numel() == 0:
+            return None
+
+        device = user_batch_emb.device
+        pos_items = pos_items.to(device)
+
+        # Use item_id_embedding for item semantics
+        item_repr = self.item_id_embedding(pos_items)  # [B, d]
+
+        # Concat User Preference + Item Semantics -> [B, 2d]
+        core = torch.cat([user_batch_emb, item_repr], dim=-1)  # [B, 2*d]
+        core = self.cond_proj_user(core)  # [B, d]
+
+        # Concat 64d prompt -> [B, 64 + d]
+        prompt = self._broadcast_prompt(core.size(0), device)
+        if prompt is None:
+            return core
+        return torch.cat([prompt, core], dim=-1)
 
     def calculate_loss(self, interaction):
         users, pos_items, neg_items = interaction
@@ -888,85 +1217,141 @@ class D2GRec(GeneralRecommender):
         # Update interaction counts
         self.update_item_interactions(torch.cat([pos_items, neg_items]))
 
-        # Base Embeddings
-        user_collab_emb, item_collab_emb = self.cge(self.user_embedding.weight, self.item_id_embedding.weight,
-                                                    self.norm_adj)
+        # ---------------- Two-stage Generation Ablation Switches ----------------
+        # Stage-1 coarse generator
+        use_stage1 = getattr(self, "use_stage1_gen", True)
+        # Stage-2 diffusion refiner (Default to use_feature_diffusion)
+        use_stage2 = getattr(self, "use_stage2_gen", getattr(self, "use_feature_diffusion", False))
 
-        # Multimodal features
+        enable_gen = (
+                getattr(self, "enable_missing_modal_generation", False)
+                and (use_stage1 or use_stage2)
+        )
+        # ---------------------------------------------------
+
+        # Base Embeddings
+        user_collab_emb, item_collab_emb = self.cge(
+            self.user_embedding.weight,
+            self.item_id_embedding.weight,
+            self.norm_adj
+        )
+
+        # Multimodal Features (Stage-0)
         item_image_emb, item_text_emb = self.mge()
 
-        # Disentangled Encoding
-        z_s_img, z_v, z_s_txt, z_t, kl_dict = self.encode_disentangled_ib()
+        # ===== IB Disentanglement (Master Switch + 3 Sub-switches) =====
+        loss_disentangle = torch.tensor(0.0, device=self.device)
+        loss_ib = torch.tensor(0.0, device=self.device)
+        loss_recon_latent = torch.tensor(0.0, device=self.device)
+        # Stage-2 Diffusion Loss (Shared + Private)
+        loss_diff_stage2 = torch.tensor(0.0, device=self.device)
 
-        # Disentanglement Loss
-        loss_disentangle = self.disentangle_losses(z_s_img, z_v, z_s_txt, z_t)
+        if self.use_ib:
+            # Disentangled Encoding
+            z_s_img, z_v, z_s_txt, z_t, kl_dict = self.encode_disentangled_ib()
 
-        # Information Bottleneck KL Loss
-        loss_kl_shared = 0.5 * (kl_dict['kl_s_img'] + kl_dict['kl_s_txt'])
-        loss_kl_private = 0.5 * (kl_dict['kl_p_img'] + kl_dict['kl_p_txt'])
-        loss_ib = self.ib_beta_shared * loss_kl_shared + self.ib_beta_private * loss_kl_private
+            # Disentanglement Loss (Shared Consistency + Private Orthogonality)
+            if self.use_ib_disentangle:
+                loss_disentangle = self.disentangle_losses(z_s_img, z_v, z_s_txt, z_t)
 
-        # Latent Space Reconstruction Consistency
-        recon_img = self.decode_modalities(z_s_img, z_v, modality="image")
-        recon_txt = self.decode_modalities(z_s_txt, z_t, modality="text")
-        loss_recon_latent = F.mse_loss(recon_img, self.image_embedding.weight) \
-                            + F.mse_loss(recon_txt, self.text_embedding.weight)
+            # Information Bottleneck KL Loss
+            if self.use_ib_kl:
+                loss_kl_shared = 0.5 * (kl_dict['kl_s_img'] + kl_dict['kl_s_txt'])
+                loss_kl_private = 0.5 * (kl_dict['kl_p_img'] + kl_dict['kl_p_txt'])
+                loss_ib = (
+                        self.ib_beta_shared * loss_kl_shared +
+                        self.ib_beta_private * loss_kl_private
+                )
 
-        # Use improved graph propagation
+            # Latent Space Reconstruction Consistency
+            if self.use_ib_latent_recon:
+                recon_img = self.decode_modalities(z_s_img, z_v, modality="image")
+                recon_txt = self.decode_modalities(z_s_txt, z_t, modality="text")
+                loss_recon_latent = (
+                        F.mse_loss(recon_img, self.image_embedding.weight) +
+                        F.mse_loss(recon_txt, self.text_embedding.weight)
+                )
+
+        # Use improved graph propagation (Modal Graph + Maturity Gating)
         for _ in range(min(self.n_mm_layers, 2)):
             item_image_emb = self._progressive_graph_propagation(item_image_emb, self.image_adj, "image")
             item_text_emb = self._progressive_graph_propagation(item_text_emb, self.text_adj, "text")
 
+        # User Modal Features: Aggregate items to user along interaction graph
         user_image_emb = torch.sparse.mm(self.adj, item_image_emb) * self.num_inters[:self.n_users]
         user_text_emb = torch.sparse.mm(self.adj, item_text_emb) * self.num_inters[:self.n_users]
 
-        # Alignment Loss
+        # ===== Alignment Loss: Image/Text + Collaborative =====
         all_items_in_batch = torch.unique(torch.cat((pos_items, neg_items))).cpu().numpy()
-        tv_index = np.setdiff1d(all_items_in_batch, np.union1d(self.missing_items_t, self.missing_items_v))
-
-        loss_alignment = self.InfoNCE(item_image_emb[tv_index], item_text_emb[tv_index],
-                                      temperature=self.infoNCETemp)
-
-        loss_modality_alignment = self.InfoNCE(user_collab_emb[users], item_collab_emb[pos_items],
-                                               temperature=self.alignUITemp)
-        loss_modality_alignment += self.InfoNCE(user_image_emb[users] + user_text_emb[users],
-                                                item_image_emb[pos_items] + item_text_emb[pos_items],
-                                                temperature=self.alignUITemp)
-        loss_modality_alignment += self.InfoNCE(item_collab_emb[pos_items],
-                                                item_image_emb[pos_items] + item_text_emb[pos_items],
-                                                temperature=self.alignBMTemp)
-        loss_modality_alignment += self.InfoNCE(user_collab_emb[users], user_image_emb[users] + user_text_emb[users],
-                                                temperature=self.alignBMTemp)
-
-        loss_align_total = self.lambda_2 * (loss_alignment + loss_modality_alignment)
-
-        # Generation and Reconstruction Loss
-        t_index = np.setdiff1d(all_items_in_batch, self.missing_items_t)
-        v_index = np.setdiff1d(all_items_in_batch, self.missing_items_v)
-
-        generated_image_from_text = self.text2image(self.perturb(item_text_emb))
-        generated_text_from_image = self.image2text(self.perturb(item_image_emb))
-
-        loss_generation = MSELoss(generated_image_from_text[v_index], item_image_emb[v_index])
-        loss_generation += MSELoss(generated_text_from_image[t_index], item_text_emb[t_index])
-
-        loss_reconstruction = self.calculate_recon_loss(
-            image=item_image_emb.detach(),
-            text=item_text_emb.detach()
+        tv_index = np.setdiff1d(
+            all_items_in_batch,
+            np.union1d(self.missing_items_t, self.missing_items_v)
         )
-        loss_gen_total = loss_generation + loss_reconstruction
+
+        loss_alignment = self.InfoNCE(
+            item_image_emb[tv_index],
+            item_text_emb[tv_index],
+            temperature=self.infoNCETemp
+        )
+
+        loss_modality_alignment = self.InfoNCE(
+            user_collab_emb[users],
+            item_collab_emb[pos_items],
+            temperature=self.alignUITemp
+        )
+        loss_modality_alignment += self.InfoNCE(
+            user_image_emb[users] + user_text_emb[users],
+            item_image_emb[pos_items] + item_text_emb[pos_items],
+            temperature=self.alignUITemp
+        )
+        loss_modality_alignment += self.InfoNCE(
+            item_collab_emb[pos_items],
+            item_image_emb[pos_items] + item_text_emb[pos_items],
+            temperature=self.alignBMTemp
+        )
+        loss_modality_alignment += self.InfoNCE(
+            user_collab_emb[users],
+            user_image_emb[users] + user_text_emb[users],
+            temperature=self.alignBMTemp
+        )
+
+        loss_align_total = self.w_align * (loss_alignment + loss_modality_alignment)
+
+        # ===== Generation and Reconstruction Loss (Stage-1 Coarse Gen) =====
+        # >>> Ablation: If use_stage1=False, this part is 0
+        loss_gen_total = torch.tensor(0.0, device=self.device)
+        if enable_gen and use_stage1:
+            t_index = np.setdiff1d(all_items_in_batch, self.missing_items_t)
+            v_index = np.setdiff1d(all_items_in_batch, self.missing_items_v)
+
+            generated_image_from_text = self.text2image(self.perturb(item_text_emb))
+            generated_text_from_image = self.image2text(self.perturb(item_image_emb))
+
+            loss_generation = MSELoss(generated_image_from_text[v_index], item_image_emb[v_index])
+            loss_generation += MSELoss(generated_text_from_image[t_index], item_text_emb[t_index])
+
+            loss_reconstruction = self.calculate_recon_loss(
+                image=item_image_emb.detach(),
+                text=item_text_emb.detach()
+            )
+            loss_gen_total = loss_generation + loss_reconstruction
+        # =======================================================
 
         # Regularization Loss
-        loss_regularization = self.reg_loss(user_collab_emb[users], item_collab_emb[pos_items],
-                                            item_collab_emb[neg_items],
-                                            item_image_emb[pos_items], item_text_emb[pos_items])
+        loss_regularization = self.reg_loss(
+            user_collab_emb[users],
+            item_collab_emb[pos_items],
+            item_collab_emb[neg_items],
+            item_image_emb[pos_items],
+            item_text_emb[pos_items]
+        )
 
-        # BPR Loss (Includes Short-term/Long-term Interest Fusion)
+        # ===== BPR + Long/Short Interest =====
         item_final_emb = item_collab_emb + (item_image_emb + item_text_emb) / 2
         user_long_all = user_collab_emb + (user_image_emb + user_text_emb) / 2
         user_short_batch = self._encode_short_term(item_final_emb, users)
 
-        # Gated Fusion
+        # Gated fusion to get user preference
         user_long_batch = user_long_all[users]
         if self.use_fixed_short_weight:
             gate_alpha = torch.full(
@@ -975,52 +1360,158 @@ class D2GRec(GeneralRecommender):
                 device=self.device
             )
         else:
-            gate_alpha = torch.sigmoid(self.gate_mlp(torch.cat([user_long_batch, user_short_batch], dim=1)))
+            gate_alpha = torch.sigmoid(
+                self.gate_mlp(torch.cat([user_long_batch, user_short_batch], dim=1))
+            )
         user_batch_emb = gate_alpha * user_short_batch + (1.0 - gate_alpha) * user_long_batch
+
+        # ===== Stage-2 Diffusion Refinement (IB Latent Space) =====
+        # >>> Ablation: If use_stage2=False, this part is 0 (and no momentum write-back)
+        if enable_gen and use_stage2 and self.use_ib and hasattr(self, "diff_shared"):
+            # 1) Shared Chain: condition = Existing Modality Shared Semantics (Train only on items with both image/text)
+            if tv_index.size > 0:
+                idx_torch = torch.from_numpy(tv_index).long().to(self.device)
+                cond_shared = self._build_shared_condition(idx_torch, z_s_img, z_s_txt)
+                if cond_shared is not None:
+                    t_shared = torch.randint(
+                        0, self.diff_timesteps,
+                        (idx_torch.size(0),),
+                        device=self.device
+                    )
+                    eps_pred_s, noise_s = self.diff_shared(
+                        z_s_img[idx_torch], cond_shared, t_shared, train_cfg=True
+                    )
+                    loss_shared = F.mse_loss(eps_pred_s, noise_s)
+                else:
+                    loss_shared = torch.tensor(0.0, device=self.device)
+            else:
+                loss_shared = torch.tensor(0.0, device=self.device)
+
+            # 2) Private Chain: condition = User Preference (Current batch user-item positive pairs)
+            cond_priv = self._build_private_condition(user_batch_emb, pos_items)
+            if cond_priv is not None:
+                t_img = torch.randint(
+                    0, self.diff_timesteps,
+                    (pos_items.size(0),),
+                    device=self.device
+                )
+                eps_pred_v, noise_v = self.diff_priv_img(
+                    z_v[pos_items], cond_priv, t_img, train_cfg=True
+                )
+                t_txt = torch.randint(
+                    0, self.diff_timesteps,
+                    (pos_items.size(0),),
+                    device=self.device
+                )
+                eps_pred_t, noise_t = self.diff_priv_txt(
+                    z_t[pos_items], cond_priv, t_txt, train_cfg=True
+                )
+                loss_private = 0.5 * (
+                        F.mse_loss(eps_pred_v, noise_v) +
+                        F.mse_loss(eps_pred_t, noise_t)
+                )
+            else:
+                loss_private = torch.tensor(0.0, device=self.device)
+
+            loss_diff_stage2 = 0.5 * (loss_shared + loss_private)
+
+            # ===== Momentum Write-back during Training (Only execute if Stage-2 is ON) =====
+            if self.missing_modal and self.training:
+                maturity_scores = self._compute_item_maturity()
+
+                # --- Write back for items missing Image ---
+                if len(self.missing_items_v) > 0:
+                    batch_v_missing = np.intersect1d(pos_items.cpu().numpy(), self.missing_items_v)
+                    if len(batch_v_missing) > 0:
+                        idx_v_missing = torch.from_numpy(batch_v_missing).long().to(self.device)
+                        gen_img_feat = self.dec_image(
+                            torch.cat([z_s_img[idx_v_missing], z_v[idx_v_missing]], dim=-1)
+                        )
+                        old_img_feat = self.image_embedding.weight.data[idx_v_missing]
+                        rho_v = maturity_scores[idx_v_missing].unsqueeze(1)
+                        self.image_embedding.weight.data[idx_v_missing] = (
+                                (1 - self.momentum_eta * rho_v) * old_img_feat +
+                                self.momentum_eta * rho_v * gen_img_feat.detach()
+                        )
+
+                # --- Write back for items missing Text ---
+                if len(self.missing_items_t) > 0:
+                    batch_t_missing = np.intersect1d(pos_items.cpu().numpy(), self.missing_items_t)
+                    if len(batch_t_missing) > 0:
+                        idx_t_missing = torch.from_numpy(batch_t_missing).long().to(self.device)
+                        gen_txt_feat = self.dec_text(
+                            torch.cat([z_s_txt[idx_t_missing], z_t[idx_t_missing]], dim=-1)
+                        )
+                        old_txt_feat = self.text_embedding.weight.data[idx_t_missing]
+                        rho_t = maturity_scores[idx_t_missing].unsqueeze(1)
+                        self.text_embedding.weight.data[idx_t_missing] = (
+                                (1 - self.momentum_eta * rho_t) * old_txt_feat +
+                                self.momentum_eta * rho_t * gen_txt_feat.detach()
+                        )
+        # =======================================================
+
+        # === User Personalized Modal Weights ===
+        w = self._get_user_modal_weights(user_batch_emb)  # [B,3] -> (w_id, w_img, w_txt)
+
+        # Per-modal Scoring (Pos/Neg)
+        pos_id = (user_batch_emb * item_collab_emb[pos_items]).sum(dim=1)
+        pos_img = (user_batch_emb * item_image_emb[pos_items]).sum(dim=1)
+        pos_txt = (user_batch_emb * item_text_emb[pos_items]).sum(dim=1)
+
+        neg_id = (user_batch_emb * item_collab_emb[neg_items]).sum(dim=1)
+        neg_img = (user_batch_emb * item_image_emb[neg_items]).sum(dim=1)
+        neg_txt = (user_batch_emb * item_text_emb[neg_items]).sum(dim=1)
+
+        pos_scores = w[:, 0] * pos_id + w[:, 1] * pos_img + w[:, 2] * pos_txt
+        neg_scores = w[:, 0] * neg_id + w[:, 1] * neg_img + w[:, 2] * neg_txt
 
         pos_item_batch_emb = item_final_emb[pos_items]
         neg_item_batch_emb = item_final_emb[neg_items]
         loss_bpr = self.bpr_loss(user_batch_emb, pos_item_batch_emb, neg_item_batch_emb)
-
-        # Prompt Learning Regularization Loss
-        prompt_reg_loss = (torch.norm(self.prompt_complete, p=2) +
-                           torch.norm(self.prompt_image_only, p=2) +
-                           torch.norm(self.prompt_text_only, p=2)) * 1e-4
 
         total_loss = (
                 loss_bpr +
                 loss_gen_total +
                 loss_align_total +
                 loss_regularization +
-                0.5 * loss_disentangle +
-                0.5 * loss_recon_latent +
+                self.w_disentangle * loss_disentangle +
+                self.w_latent_recon * loss_recon_latent +
                 loss_ib +
-                prompt_reg_loss
+                self.w_diff * loss_diff_stage2  # Diffusion loss (0 if use_stage2=False)
         )
 
         return total_loss
 
-    def update_adj(self):
-        """Update adjacency matrix (now using progressive method)"""
+    def update_adj(self, maturity_mask=None):
+        """Update adjacency matrix (now uses progressive method)"""
+        # Store mask if passed externally
+        if maturity_mask is not None:
+            self.maturity_mask = maturity_mask
+
         if self.progressive_integration:
             self.progressive_update_adj()
         else:
-            # Original traditional update method
+            # Traditional update method
             self._traditional_update_adj()
 
     def _traditional_update_adj(self):
-        """Traditional adjacency matrix update method"""
-        print(f"Epoch {self.current_epoch}: Traditional adjacency matrix update method")
+        """Traditional adjacency matrix update (Based on IB Disentangled Graph Features)"""
+        print(f"Epoch {self.current_epoch}: Traditional adjacency matrix update")
         with torch.no_grad():
             t_index = self.missing_items_t
             v_index = self.missing_items_v
 
-        with torch.no_grad():
-            # Image adjacency matrix update
+            # 1. Get current modal features for graph construction (g_img, g_txt)
+            img_feat, txt_feat = self._get_modal_graph_features()
+            img_feat = img_feat.detach()
+            txt_feat = txt_feat.detach()
+
+            # ===== Image Adjacency Update =====
             self.image_adj = self.image_adj.cpu().to_dense()
             torch.cuda.empty_cache()
 
-            image_adj = build_sim(self.image_embedding.weight.detach())
+            # Build similarity / KNN based on IB features
+            image_adj = build_sim(img_feat)
             if self.adaptive_knn:
                 maturity_scores = self._compute_item_maturity()
                 image_adj = self.adaptive_knn_builder.build_adaptive_knn(image_adj, maturity_scores)
@@ -1028,15 +1519,19 @@ class D2GRec(GeneralRecommender):
                 image_adj = build_knn_neighbourhood(image_adj, topk=self.knn_k)
             image_adj = compute_normalized_laplacian(image_adj).cpu()
 
-            self.image_adj[v_index] = image_adj[v_index] * self.alpha + self.image_adj[v_index] * (1 - self.alpha)
+            # EMA Update for missing items rows only
+            self.image_adj[v_index] = (
+                    image_adj[v_index] * self.alpha
+                    + self.image_adj[v_index] * (1 - self.alpha)
+            )
             self.image_adj = self.image_adj.to_sparse_coo()
             del image_adj
 
-            # Text adjacency matrix update
+            # ===== Text Adjacency Update =====
             self.text_adj = self.text_adj.cpu().to_dense()
             torch.cuda.empty_cache()
 
-            text_adj = build_sim(self.text_embedding.weight.detach())
+            text_adj = build_sim(txt_feat)
             if self.adaptive_knn:
                 maturity_scores = self._compute_item_maturity()
                 text_adj = self.adaptive_knn_builder.build_adaptive_knn(text_adj, maturity_scores)
@@ -1044,7 +1539,11 @@ class D2GRec(GeneralRecommender):
                 text_adj = build_knn_neighbourhood(text_adj, topk=self.knn_k)
             text_adj = compute_normalized_laplacian(text_adj).cpu()
 
-            self.text_adj[t_index] = text_adj[t_index] * self.alpha + self.text_adj[t_index] * (1 - self.alpha)
+            # EMA Update for missing items rows only
+            self.text_adj[t_index] = (
+                    text_adj[t_index] * self.alpha
+                    + self.text_adj[t_index] * (1 - self.alpha)
+            )
             self.text_adj = self.text_adj.to_sparse_coo()
             del text_adj
 
@@ -1052,12 +1551,11 @@ class D2GRec(GeneralRecommender):
             self.image_adj = self.image_adj.to(self.device)
             self.text_adj = self.text_adj.to(self.device)
 
-    # Keep other methods unchanged...
     def _build_user_seq_cache(self, dataset):
         try:
             result = dataset.get_user_sequences(self.max_seq_len)
             if isinstance(result, tuple):
-                # Assume the first element is the user sequence dictionary
+                # Assume first element is seq dict
                 seq_dict = result[0]
             else:
                 seq_dict = result
@@ -1067,7 +1565,6 @@ class D2GRec(GeneralRecommender):
             self.logger.warning(f'get_user_sequences not available ({e}); falling back to empty sequences.')
             seq_dict = {}
 
-        import torch
         n, L = self.n_users, self.max_seq_len
         self._user_seq = torch.full((n, L), fill_value=-1, dtype=torch.long)
         self._user_seq_len = torch.zeros(n, dtype=torch.long)
@@ -1080,7 +1577,6 @@ class D2GRec(GeneralRecommender):
                 self._user_seq_len[u] = l
 
     def _encode_short_term(self, item_emb, users):
-        import torch
         device = self.device
 
         users_cpu = users.detach().cpu()
@@ -1109,7 +1605,7 @@ class D2GRec(GeneralRecommender):
         for module in modules:
             for param in module.parameters():
                 param.requires_grad = False
-        print(f"Frozen parameters of {len(modules)} modules")
+        print(f"Froze parameters for {len(modules)} modules")
 
     def encode_disentangled_ib(self):
         item_image_emb = torch.sigmoid(
@@ -1171,7 +1667,57 @@ class D2GRec(GeneralRecommender):
         loss_ortho = orthogonal_penalty(z_s_img, z_v) + orthogonal_penalty(z_s_txt, z_t)
         return loss_shared_consistency + 0.1 * loss_ortho
 
-    # Other methods unchanged...
+    # ====== Added: IB Disentanglement Statistics (For Plotting) ======
+
+    @torch.no_grad()
+    def get_ib_stats(self, sample_ratio: float = 0.1):
+        """
+        Sample a subset of items to calculate three cosine similarity curves in IB latent space:
+          1) Shared vs Private (Image): E_g_img vs E_s_img   ≈  z_s_img vs z_v
+          2) Shared vs Private (Text): E_g_txt vs E_s_txt   ≈  z_s_txt vs z_t
+          3) Shared vs Shared (Cross-modal): E_g_img vs E_g_txt ≈  z_s_img vs z_s_txt
+
+        Returns a dict with mean/std for each curve.
+        """
+        # If IB is off, skip
+        if not getattr(self, "use_ib", False):
+            return None
+
+        # Reuse encode_disentangled_ib to get latent vectors for all items
+        z_s_img, z_v, z_s_txt, z_t, _ = self.encode_disentangled_ib()
+        n_items = z_s_img.size(0)
+        device = z_s_img.device
+
+        # Random sample to save time
+        if sample_ratio <= 0 or sample_ratio >= 1:
+            idx = torch.arange(n_items, device=device)
+        else:
+            sample_size = max(1, int(n_items * sample_ratio))
+            perm = torch.randperm(n_items, device=device)
+            idx = perm[:sample_size]
+
+        z_s_img = z_s_img[idx]
+        z_v = z_v[idx]
+        z_s_txt = z_s_txt[idx]
+        z_t = z_t[idx]
+
+        def _cos_stats(a: torch.Tensor, b: torch.Tensor):
+            """Calculate mean/variance for a cosine similarity curve"""
+            a_n = F.normalize(a, dim=-1)
+            b_n = F.normalize(b, dim=-1)
+            sim = (a_n * b_n).sum(dim=-1)  # [B]
+            return {
+                "mean": sim.mean().item(),
+                "std": sim.std(unbiased=False).item()
+            }
+
+        stats = {
+            "E_g_img_vs_E_s_img": _cos_stats(z_s_img, z_v),
+            "E_g_txt_vs_E_s_txt": _cos_stats(z_s_txt, z_t),
+            "E_g_img_vs_E_g_txt": _cos_stats(z_s_img, z_s_txt),
+        }
+        return stats
+
     def preprocess_missing_modal(self, config):
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
         self.missing_ratio = config['missing_ratio']
@@ -1183,7 +1729,7 @@ class D2GRec(GeneralRecommender):
             self.missing_items = {'t': np.array([]), 'v': np.array([]), 'all': np.array([])}
             self.missing_items_t = np.array([])
             self.missing_items_v = np.array([])
-            self.missing_modal = False
+            self.missing_modal = True
             return
 
         self.missing_items = np.load(missing_info_path, allow_pickle=True).item()
@@ -1204,20 +1750,24 @@ class D2GRec(GeneralRecommender):
 
         non_missing_item_t = np.setdiff1d(self.all_items, self.missing_items_t)
         non_missing_item_v = np.setdiff1d(self.all_items, self.missing_items_v)
+        self.mean_fill_old_items = bool(config["mean_fill_old_items"])
+        if self.mean_fill_old_items:
+            if self.v_feat is not None and len(non_missing_item_v) > 0 and len(self.missing_items_v) > 0:
+                image_mean = self.v_feat[non_missing_item_v].mean(dim=0)
+                fill_v = np.setdiff1d(self.missing_items_v, getattr(self, "new_items_set", np.array([], dtype=int)))
+                if len(fill_v) > 0:
+                    self.v_feat.data[fill_v] = image_mean
+                    self.logger.info(f"Filled {len(fill_v)} missing visual features with mean value (old items only).")
 
-        if self.v_feat is not None and len(non_missing_item_v) > 0 and len(self.missing_items_v) > 0:
-            image_mean = self.v_feat[non_missing_item_v].mean(dim=0)
-            fill_v = np.setdiff1d(self.missing_items_v, getattr(self, "new_items_set", np.array([], dtype=int)))
-            if len(fill_v) > 0:
-                self.v_feat.data[fill_v] = image_mean
-                self.logger.info(f"Filled {len(fill_v)} missing visual features with mean value (old items only).")
+            if self.t_feat is not None and len(non_missing_item_t) > 0 and len(self.missing_items_t) > 0:
+                text_mean = self.t_feat[non_missing_item_t].mean(dim=0)
+                fill_t = np.setdiff1d(self.missing_items_t, getattr(self, "new_items_set", np.array([], dtype=int)))
+                if len(fill_t) > 0:
+                    self.t_feat.data[fill_t] = text_mean
+                    self.logger.info(f"Filled {len(fill_t)} missing text features with mean value (old items only).")
 
-        if self.t_feat is not None and len(non_missing_item_t) > 0 and len(self.missing_items_t) > 0:
-            text_mean = self.t_feat[non_missing_item_t].mean(dim=0)
-            fill_t = np.setdiff1d(self.missing_items_t, getattr(self, "new_items_set", np.array([], dtype=int)))
-            if len(fill_t) > 0:
-                self.t_feat.data[fill_t] = text_mean
-                self.logger.info(f"Filled {len(fill_t)} missing text features with mean value (old items only).")
+        else:
+           self.logger.info("Skip mean fill for old items (generation ablation).")
 
     def init_mi_estimator(self):
         self.item_image_estimator = CLUBSample(self.embedding_dim, self.embedding_dim, 64).to(self.device)
@@ -1233,16 +1783,151 @@ class D2GRec(GeneralRecommender):
     def full_sort_predict(self, interaction):
         users, _ = interaction
 
-        user_embeddings, item_embedding = self.cge(self.user_embedding.weight, self.item_id_embedding.weight,
-                                                   self.norm_adj)
+        # ====== Base Collaborative Embedding ======
+        user_embeddings, item_embedding = self.cge(
+            self.user_embedding.weight, self.item_id_embedding.weight, self.norm_adj
+        )
 
+        maturity_scores = self._compute_item_maturity()
+
+        # ====== Two-stage Generation Switches ======
+        use_stage1 = getattr(self, "use_stage1_gen", False)
+        use_stage2 = getattr(self, "use_stage2_gen", getattr(self, "use_feature_diffusion", True))
+
+        # ====== Stage-1/2 Online Generation: Only for "New & Missing" Items (Once) ======
+        if (getattr(self, "use_ib", False)
+                and getattr(self, "enable_missing_modal_generation", False)
+                and (use_stage1 or use_stage2)
+                and (not use_stage2 or hasattr(self, "diff_shared"))
+                and not getattr(self, "_stage2_infer_done", False)):
+
+            # Only for: New Items INTERSECT Missing Modality
+            new_items = getattr(self, "new_items_set", np.array([], dtype=int))
+            miss_v = getattr(self, "missing_items_v", np.array([], dtype=int))
+            miss_t = getattr(self, "missing_items_t", np.array([], dtype=int))
+
+            if self.generate_only_new:
+                gen_img_items = np.intersect1d(new_items, miss_v)
+                gen_txt_items = np.intersect1d(new_items, miss_t)
+            else:
+                gen_img_items = miss_v
+                gen_txt_items = miss_t
+
+            if gen_img_items.size > 0 or gen_txt_items.size > 0:
+                # 1) Encode all items in IB space
+                z_s_img, z_v, z_s_txt, z_t, _ = self.encode_disentangled_ib()
+
+                # 2) Precompute shared semantics for Stage-2 condition
+                item_image_sem = torch.sigmoid(
+                    self.shared_encoder(torch.sigmoid(self.image_encoder(self.image_embedding.weight)))
+                )
+                item_text_sem = torch.sigmoid(
+                    self.shared_encoder(torch.sigmoid(self.text_encoder(self.text_embedding.weight)))
+                )
+
+                # ---------------- (a) Generate Missing [Image] ----------------
+                if gen_img_items.size > 0:
+                    idx_img = torch.from_numpy(gen_img_items).long().to(self.device)
+                    K_img = idx_img.size(0)
+
+                    # Prompt
+                    prompt_img = self._broadcast_prompt(K_img, self.device)  # [K,64]
+
+                    # Base Latent: Use Text side latent as condition
+                    base_shared = z_s_txt[idx_img]  # [K,z_dim]
+                    base_priv = z_t[idx_img]  # [K,z_dim]
+
+                    # ---- Stage-1: Coarse Shared/Private ----
+                    if use_stage1:
+                        z_s_img_coarse = self.stage1_shared_gen(
+                            torch.cat([base_shared, prompt_img], dim=-1)
+                        )
+                        z_v_coarse = self.stage1_priv_img_gen(
+                            torch.cat([base_priv, prompt_img], dim=-1)
+                        )
+                    else:
+                        # w/o Stage-1: Use base latent directly
+                        z_s_img_coarse = base_shared
+                        z_v_coarse = base_priv
+
+                    # ---- Stage-2: Refine Shared (Optional) ----
+                    if use_stage2:
+                        sem_txt = item_text_sem[idx_img]  # [K, embedding_dim]
+                        cond_shared_img = torch.cat([prompt_img, sem_txt], dim=-1)  # [K,64+emb]
+                        z_s_img_refined = self.diff_shared.sample_cfg(z_s_img_coarse, cond_shared_img)
+                        gen_image_feat = self.dec_image(
+                            torch.cat([z_s_img_refined, z_v_coarse], dim=-1)
+                        )  # [K,4096]
+                    else:
+                        # w/o Stage-2: Decode coarse directly
+                        gen_image_feat = self.dec_image(
+                            torch.cat([z_s_img_coarse, z_v_coarse], dim=-1)
+                        )  # [K,4096]
+
+                    # Momentum update back to Image Embedding (Overwrite only new & missing)
+                    old_feat_img = self.image_embedding.weight.data[idx_img]
+                    rho_img = maturity_scores[idx_img].unsqueeze(1)  # [K,1]
+                    self.image_embedding.weight.data[idx_img] = (
+                            (1 - self.momentum_eta * rho_img) * old_feat_img +
+                            self.momentum_eta * rho_img * gen_image_feat
+                    )
+
+                # ---------------- (b) Generate Missing [Text] ----------------
+                if gen_txt_items.size > 0:
+                    idx_txt = torch.from_numpy(gen_txt_items).long().to(self.device)
+                    K_txt = idx_txt.size(0)
+
+                    prompt_txt = self._broadcast_prompt(K_txt, self.device)  # [K,64]
+
+                    # Base Latent: Use Image side latent as condition
+                    base_shared_txt = z_s_img[idx_txt]  # [K,z_dim]
+                    base_priv_txt = z_v[idx_txt]  # [K,z_dim]
+
+                    # ---- Stage-1: Coarse Shared/Private ----
+                    if use_stage1:
+                        z_s_txt_coarse = self.stage1_shared_gen(
+                            torch.cat([base_shared_txt, prompt_txt], dim=-1)
+                        )
+                        z_t_coarse = self.stage1_priv_txt_gen(
+                            torch.cat([base_priv_txt, prompt_txt], dim=-1)
+                        )
+                    else:
+                        z_s_txt_coarse = base_shared_txt
+                        z_t_coarse = base_priv_txt
+
+                    # ---- Stage-2: Refine Shared (Optional) ----
+                    if use_stage2:
+                        sem_img = item_image_sem[idx_txt]  # [K, embedding_dim]
+                        cond_shared_txt = torch.cat([prompt_txt, sem_img], dim=-1)
+                        z_s_txt_refined = self.diff_shared.sample_cfg(z_s_txt_coarse, cond_shared_txt)
+                        gen_text_feat = self.dec_text(
+                            torch.cat([z_s_txt_refined, z_t_coarse], dim=-1)
+                        )  # [K,384]
+                    else:
+                        gen_text_feat = self.dec_text(
+                            torch.cat([z_s_txt_coarse, z_t_coarse], dim=-1)
+                        )  # [K,384]
+
+                    # Momentum update back to Text Embedding
+                    old_feat_txt = self.text_embedding.weight.data[idx_txt]
+                    rho_txt = maturity_scores[idx_txt].unsqueeze(1)
+                    self.text_embedding.weight.data[idx_txt] = (
+                            (1 - self.momentum_eta * rho_txt) * old_feat_txt +
+                            self.momentum_eta * rho_txt * gen_text_feat
+                    )
+
+            # Flag: Stage-2 inference done for this round
+            self._stage2_infer_done = True
+
+        # ====== Continue Inference with (possibly updated) features ======
         item_image, item_text = self.mge()
 
-        item_image_filter = torch.sparse.mm(self.adj.t(), F.tanh(
-            self.image_preference_(self.user_embedding.weight))) * self.num_inters[self.n_users:]
-        item_text_filter = torch.sparse.mm(self.adj.t(),
-                                           F.tanh(self.text_preference_(self.user_embedding.weight))) * self.num_inters[
-                                                                                                        self.n_users:]
+        item_image_filter = torch.sparse.mm(
+            self.adj.t(), F.tanh(self.image_preference_(self.user_embedding.weight))
+        ) * self.num_inters[self.n_users:]
+        item_text_filter = torch.sparse.mm(
+            self.adj.t(), F.tanh(self.text_preference_(self.user_embedding.weight))
+        ) * self.num_inters[self.n_users:]
 
         # Use improved graph propagation
         for _ in range(min(self.n_mm_layers, 2)):
@@ -1271,10 +1956,23 @@ class D2GRec(GeneralRecommender):
             gate_alpha = torch.sigmoid(self.gate_mlp(torch.cat([user_long_batch, user_short_batch], dim=1)))
         user_emb_batch = gate_alpha * user_short_batch + (1.0 - gate_alpha) * user_long_batch
 
-        scores = user_emb_batch @ item_emb_final.T
+        # === User Modal Weights (Consistent with Training) ===
+        w = self._get_user_modal_weights(user_emb_batch)  # [B,3]
+
+        # Per-modal Scoring
+        score_id = user_emb_batch @ item_emb_final.T
+        score_img = user_emb_batch @ item_image.T
+        score_txt = user_emb_batch @ item_text.T
+
+        # Weighted Sum
+        scores = (
+                w[:, 0:1] * score_id +
+                w[:, 1:2] * score_img +
+                w[:, 2:3] * score_txt
+        )  # [B,N]
+
         return scores
 
-    # Add other necessary methods...
     def scipy_matrix_to_sparse_tenser(self, matrix, shape):
         row = matrix.row
         col = matrix.col
@@ -1286,7 +1984,7 @@ class D2GRec(GeneralRecommender):
         A = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
 
         if not self.enable_dynamic_weighting:
-            print("Building adjacency matrix: using static weights (value of 1).")
+            print("Constructing Adjacency Matrix: Using Static Weights (Value=1).")
             inter_M = self.interaction_matrix
             inter_M_t = self.interaction_matrix.transpose()
             data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
@@ -1294,7 +1992,7 @@ class D2GRec(GeneralRecommender):
             for key, value in data_dict.items():
                 A[key] = value
         else:
-            print(f"Building adjacency matrix: using dynamic weights (time decay factor lambda={self.time_decay_lambda}).")
+            print(f"Constructing Adjacency Matrix: Using Dynamic Weights (Decay Factor lambda={self.time_decay_lambda}).")
             for user_id, item_id, timestamp, rating in self.interaction_history:
                 time_diff = self.latest_timestamp - timestamp
                 recency_weight = np.exp(-self.time_decay_lambda * time_diff)
